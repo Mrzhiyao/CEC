@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+
+# Model / data files
+*.pth
+*.pt
+*.pkl
+*.bin
+*.safetensors
+
+# Milvus backup
+data/milvus_backup/
+
+# Expert demonstrations (large, hosted on Google Drive)
+expert_demonstrations/

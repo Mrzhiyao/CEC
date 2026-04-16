@@ -1,0 +1,211 @@
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.nn as nn
+from torch.nn.utils import clip_grad_norm_
+import numpy as np
+import math
+import copy
+import random
+import psutil
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.distributions import Categorical
+import random
+import torch.profiler
+
+################################## PPO Policy ##################################
+class RolloutBuffer:
+    def __init__(self):
+        self.actions = []
+        self.states_for_ppo = []
+        self.logprobs = []
+        self.rewards = []
+        self.states_for_common = []
+
+    def clear(self):
+        del self.actions[:]
+        del self.states_for_ppo[:]
+        del self.logprobs[:]
+        del self.rewards[:]
+        del self.states_for_common[:]
+
+
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim_critic, state_dim_actor, action_dim, actor_node, critic_node, device):
+        super(ActorCritic, self).__init__()
+        self.device = device
+        self.action_dim = action_dim
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim_actor, actor_node),
+            nn.Tanh(),
+            nn.Linear(actor_node, actor_node),
+            nn.Tanh(),
+            nn.Linear(actor_node, actor_node),
+            nn.Tanh(),
+            nn.Linear(actor_node, action_dim),
+            nn.Softmax(dim=-1)
+        )
+
+        # 通过价值输出动作
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim_critic, critic_node),
+            nn.Tanh(),
+            nn.Linear(critic_node, critic_node),
+            nn.Tanh(),
+            nn.Linear(critic_node, critic_node),
+            nn.Tanh(),
+            nn.Linear(critic_node, 1)
+        )
+        # 通过策略评估state+action
+    def get_new_state(self, state_for_ppo, task_input):
+        att = self.linear_layer(self.transen(task_input.view(1, 1, 768)).view(1, 768))
+        new_state = torch.cat([state_for_ppo[0:30], att.squeeze()], 0)
+
+        return new_state
+
+    def get_action(self, state, eval=False):
+
+        uniform_data = [[float(elem) if isinstance(elem, np.ndarray) else float(elem) for elem in sublist] for sublist in state]
+
+        data_array = np.array(uniform_data)
+        state = torch.from_numpy(np.squeeze(data_array)).float().to(self.device)
+        initial_ram = psutil.Process().memory_info().rss / (1024 )
+        vram_allocated1 = torch.cuda.memory_allocated() / (1024 )
+        action_probs = self.actor(state)
+
+        dist = Categorical(action_probs)
+        action = dist.sample()
+        action_logprob = dist.log_prob(action)
+
+        action2 = 0
+        return action.detach().cpu().numpy(), np.array(action2)
+
+
+    def evaluate(self, state_for_ppo, state_for_common, action, action_oldlogprobs):
+        action_probs = self.actor(state_for_ppo)
+        dist = Categorical(action_probs)
+        action_logprobs = dist.log_prob(action)
+        dist_entropy = dist.entropy()
+        state_for_common_values = self.critic(state_for_common)
+        return action_logprobs, state_for_common_values, dist_entropy
+
+
+class PPO:
+    def __init__(self, state_dim_critic, state_dim_actor, action_dim, actor_node, critic_node, lr_actor, lr_critic,
+                 gamma, K_epochs, eps_clip, device):
+        self.device = device
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.K_epochs = K_epochs
+        self.buffer = RolloutBuffer()
+        self.policy = ActorCritic(state_dim_critic, state_dim_actor, action_dim, actor_node, critic_node, self.device).to(
+            self.device)
+        self.policy.load_state_dict(torch.load("ppo-vectorkeywords-pretrain-vectorkeywords.pth"))
+        self.optimizer = torch.optim.Adam([
+            {'params': self.policy.actor.parameters(), 'lr': lr_actor},
+            {'params': self.policy.critic.parameters(), 'lr': lr_critic},
+        ])
+        self.policy_old = ActorCritic(state_dim_critic, state_dim_actor, action_dim, actor_node, critic_node, self.device).to(
+            self.device)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        self.policy_old.load_state_dict(torch.load("ppo-vectorkeywords-pretrain-vectorkeywords.pth"))
+        self.MseLoss = nn.MSELoss()
+
+    def generate_unique_random_numbers(self, start, end, count):
+        numbers = set()
+
+        while len(numbers) < count:
+            number = random.randint(start, end)
+            numbers.add(number)
+
+        return list(numbers)
+
+    def learn(self, steps, experiences):
+        original_states, actions, exe_rewards, next_states, dones = experiences
+        indices = torch.LongTensor([i for i in range(0, 15)] + [15, 18, 19, 22, 23, 26])
+        indices = indices.to(self.device)
+        
+        states = original_states.index_select(1, indices)
+        learn_states_for_ppo = states
+        learn_states_for_common = states
+        learn_actions = actions
+        from torch.distributions import Categorical
+        learn_logprobs = []
+        for x in range(len(states)):
+            if actions[x] == 0:
+                dist = Categorical(torch.tensor([1,0,0,0]).to(self.device))
+
+            elif actions[x] == 1:
+                dist = Categorical(torch.tensor([0,1,0,0]).to(self.device))
+
+            elif actions[x] == 2:
+                dist = Categorical(torch.tensor([0,0,1,0]).to(self.device))
+
+            elif actions[x] == 3:
+                dist = Categorical(torch.tensor([0,0,0,1]).to(self.device))
+            action_logprob = dist.log_prob(torch.tensor(actions[x]).to(self.device))
+            learn_logprobs.append(action_logprob)
+
+        discounted_reward = 0
+
+        rewards = []
+        for reward in reversed(torch.squeeze(exe_rewards)):
+            discounted_reward = reward + (self.gamma * discounted_reward)
+            rewards.insert(0, discounted_reward)
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+        old_states_for_ppo = learn_states_for_ppo.detach().to(self.device)
+        old_states_for_common = learn_states_for_ppo.detach().to(self.device)
+        old_actions = torch.squeeze(learn_actions).detach().to(self.device)
+        old_logprobs = torch.tensor(learn_logprobs).detach().to(self.device)
+
+        output_loss = []
+        output_policy_loss = []
+        output_value_loss = []
+
+        for _ in range(self.K_epochs):
+            logprobs, states_for_common_values, dist_entropy = self.policy.evaluate(old_states_for_ppo,
+                                                                                    old_states_for_common, old_actions,
+                                                                                    old_logprobs)
+            states_for_common_values = torch.squeeze(states_for_common_values)
+
+            ratios = torch.exp(logprobs - old_logprobs.detach())
+            advantages = rewards - states_for_common_values.detach()
+            surr1 = ratios * advantages
+
+            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(states_for_common_values,
+                                                                 rewards) - 0.01 * dist_entropy
+            self.optimizer.zero_grad()
+            loss.mean().backward()
+            self.optimizer.step()
+            policy_loss = -torch.min(surr1, surr2)
+            value_loss = self.MseLoss(states_for_common_values, rewards)
+            
+
+            output_loss.append(loss.mean())
+            output_policy_loss.append(policy_loss.mean())
+            output_value_loss.append(value_loss.mean())
+
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        self.buffer.clear()
+
+        model_policy = self.policy_old
+        if steps % 100 == 0 and steps !=0:
+            torch.save(model_policy.state_dict(), './train_models/model_network' + str((steps+1) / 10) + '.pth')
+            print('模型保存成功')        
+
+        return loss, output_policy_loss, output_value_loss, output_loss
+
+    def get_action(self, state, eval=False):
+        action1, action2 = self.policy.get_action(state)
+        return action1, action2
+
+    def save(self, model_path_and_name):
+        torch.save(self.policy_old.state_dict(), model_path_and_name)
+
+    def load(self, model_path_and_name):
+        self.policy_old.load_state_dict(torch.load(model_path_and_name, map_location=lambda storage, loc: storage))
+        self.policy.load_state_dict(torch.load(model_path_and_name, map_location=lambda storage, loc: storage))
